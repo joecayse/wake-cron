@@ -1,4 +1,4 @@
-# wake-cron: macOS Power Management and Task Scheduling Utility
+# wake-cron: Schedules a cron job and ensures your Mac wakes up to run it
 
 ## Introduction
 `wake-cron` is a lightweight, command-line utility designed specifically for macOS environments. It addresses the common friction point between hardware energy management and task automation. On macOS, the system power controller (pmset) and the cron daemon function as independent systems; `wake-cron` bridges this gap to ensure hardware availability before automated tasks execute.
