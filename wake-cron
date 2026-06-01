@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# wake-cron: Unified hardware wake and crontab synchronization for macOS
+# ==============================================================================
+
+set -e
+
+# Print usage instructions
+usage() {
+    echo "Usage: wake-cron [HH:MM] \"[cron_command]\""
+    echo "Example: wake-cron 06:15 \"/usr/bin/python3 /path/to/script.py\""
+    exit 1
+}
+
+# Ensure correct number of arguments passed
+if [ "$#" -ne 2 ]; then
+    usage
+fi
+
+TARGET_TIME=$1
+CRON_CMD=$2
+
+# Validate time format (HH:MM, 24-hour clock)
+if [[ ! $TARGET_TIME =~ ^([0-1][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+    echo "[X] Error: Invalid time format. Please use HH:MM (24-hour format, e.g., 06:15)."
+    exit 1
+fi
+
+# Extract components
+TARGET_HOUR=$(echo "$TARGET_TIME" | cut -d: -f1)
+TARGET_MIN=$(echo "$TARGET_TIME" | cut -d: -f2)
+
+# Convert strings to base-10 integers to protect against octal interpretation issues
+TARGET_HOUR=$((10#$TARGET_HOUR))
+TARGET_MIN=$((10#$TARGET_MIN))
+
+# Calculate hardware wake time (Target time minus a 5-minute buffer)
+WAKE_HOUR=$TARGET_HOUR
+WAKE_MIN=$((TARGET_MIN - 5))
+
+# Handle time underflow arithmetic safely
+if [ $WAKE_MIN -lt 0 ]; then
+    WAKE_MIN=$((WAKE_MIN + 60))
+    WAKE_HOUR=$((WAKE_HOUR - 1))
+    if [ $WAKE_HOUR -lt 0 ]; then
+        WAKE_HOUR=23
+    fi
+fi
+
+# Format wake string to preserve leading zeros for pmset (HH:MM:SS)
+WAKE_TIME_STR=$(printf "%02d:%02d:00" $WAKE_HOUR $WAKE_MIN)
+
+echo "[*] Target execution synchronized at: $(printf "%02d:%02d" $TARGET_HOUR $TARGET_MIN)"
+echo "[*] Configuring hardware-level alarm wake at: $WAKE_TIME_STR"
+
+# 1. Update Hardware Power Schedule (Requires root escalation)
+echo "[!] Escalating privileges to update macOS power management schedule..."
+echo "[!] Note: macOS only supports one repeating hardware schedule. Previous schedules will be overwritten."
+sudo pmset repeat wake MTWRFSU "$WAKE_TIME_STR"
+
+# 2. Update User-Level Crontab (Kept entirely within user-space context)
+echo "[*] Injecting target task into user crontab..."
+
+# Format the cron schedule string
+CRON_ENTRY="$TARGET_MIN $TARGET_HOUR * * * $CRON_CMD"
+
+# Safely read existing crontab (ignoring 'no crontab' errors) and filter out fixed strings
+OLD_CRONTAB=$(crontab -l 2>/dev/null | grep -F -v "$CRON_CMD" || true)
+
+# Atomically deploy the newly combined crontab layout
+(
+    if [ -n "$OLD_CRONTAB" ]; then
+        echo "$OLD_CRONTAB"
+    fi
+    echo "$CRON_ENTRY"
+) | crontab -
+
+echo "[SUCCESS] wake-cron synchronization finalized."
+echo "          -> Hardware wakeup armed for $WAKE_TIME_STR every day."
+echo "          -> Cron engine scheduled task execution for $TARGET_TIME every day."
