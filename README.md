@@ -34,6 +34,10 @@ wake-cron 06:15 "/usr/bin/python3 /Users/joecayse/example.py
 ## System Requirements & Security
 Due to macOS security sandboxing, the cron engine requires explicit Full Disk Access.
 
+**AC Power Dependency:** For reliable execution, wake-cron requires the system to be connected to AC power. macOS energy-management policies significantly throttle or suppress hardware wake events when operating on battery.
+**Hardware Assertions:** macOS may prevent wake events based on thermal conditions or active assertions. Users can check for blocking states using pmset -g assertions.
+**Future Roadmap:** Future versions may transition to launchd to provide more robust task scheduling and better integration with native macOS power management.
+
 | Step | Action |
 | :--- | :--- |
 | 1 | Navigate to System Settings > Privacy & Security > Full Disk Access. |
