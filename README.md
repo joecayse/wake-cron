@@ -31,14 +31,8 @@ wake-cron [HH:MM] "[executable_command]"
 Operational Example:
 wake-cron 06:15 "/usr/bin/python3 /Users/joecayse/example.py
 
-## System Requirements & Security
+## System Requirements, Limitations, & Security
 Due to macOS security sandboxing, the cron engine requires explicit Full Disk Access.
-
-**AC Power Dependency:** For reliable execution, wake-cron requires the system to be connected to AC power. macOS energy-management policies significantly throttle or suppress hardware wake events when operating on battery.
-
-**Hardware Assertions:** macOS may prevent wake events based on thermal conditions or active assertions. Users can check for blocking states using pmset -g assertions.
-
-**Future Roadmap:** Future versions may transition to launchd to provide more robust task scheduling and better integration with native macOS power management.
 
 | Step | Action |
 | :--- | :--- |
@@ -46,6 +40,13 @@ Due to macOS security sandboxing, the cron engine requires explicit Full Disk Ac
 | 2 | Select the + button. |
 | 3 | Use Cmd + Shift + G to navigate to /usr/sbin/cron. |
 | 4 | Ensure the service toggle is switched to ON. |
+
+
+**AC Power Dependency:** For reliable execution, wake-cron requires the system to be connected to AC power. macOS energy-management policies significantly throttle or suppress hardware wake events when operating on battery.
+
+**Hardware Assertions:** macOS may prevent wake events based on thermal conditions or active assertions. Users can check for blocking states using pmset -g assertions.
+
+**Future Roadmap:** Future versions may transition to launchd to provide more robust task scheduling and better integration with native macOS power management.
 
 ## Summary
 `wake-cron` simplifies the automation lifecycle for macOS users requiring deterministic execution of background tasks. By coupling hardware wake events with standard cron scheduling, it minimizes execution failure due to power-state transitions. This utility is maintained under the MIT License and is designed for modular expansion to include advanced CLI flags in future releases.
