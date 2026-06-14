@@ -27,15 +27,42 @@ It arms the hardware wake alarm 5 minutes early via `pmset`, deploys the job as 
 
 ## Why launchd Instead of cron
 
-The original version used `cron`, which **silently drops jobs scheduled while the system is asleep**. `wake-cron` uses macOS-native **launchd LaunchAgents** with `StartCalendarInterval`. launchd fires any missed calendar jobs immediately upon the next system wake.
+Both the original and current versions use `pmset` to wake the hardware — that part is identical. The scheduler (cron vs. launchd) doesn't affect whether the Mac wakes up; `pmset` determines that.
+
+The difference is what happens **after** the Mac wakes:
+
+- **cron** runs on a fixed tick. If the system was still initializing when the scheduled minute passed, or if `pmset` failed to wake the Mac and the user opens the lid hours later, cron treats the scheduled time as missed and silently skips the job.
+- **launchd** (`StartCalendarInterval`) detects that a job was missed and fires it immediately on the next wake — whenever that is. If `pmset` failed and the user opens the lid at noon, launchd still runs the 06:15 job.
 
 | Behavior | cron | launchd |
 | :--- | :--- | :--- |
 | Fires while system is awake | ✅ | ✅ |
-| Fires missed job after wake from sleep | ❌ | ✅ |
+| Catches up missed job after any wake | ❌ | ✅ |
 | Full PATH / user environment | ❌ | ✅ (login shell) |
 | Timeout guardrail for hung scripts | ❌ | ✅ |
 | Multiple independent job schedules | ✅ | ✅ |
+
+In short: **`pmset` determines wake reliability. launchd buys you recovery when `pmset` itself fails.**
+
+## Sleep Mode and Battery Limitations
+
+wake-cron arms a hardware wake alarm via `pmset`. Whether that alarm fires depends on the Mac's sleep state:
+
+| Sleep state | Triggered by | Wake alarm honoured? |
+| :--- | :--- | :--- |
+| Standard sleep (`hibernatemode 0`) | Lid close, idle timeout | ✅ Yes |
+| Safe sleep (`hibernatemode 3`, default) | Lid close, idle timeout | ✅ Usually — unless battery critically low |
+| Full hibernation (`hibernatemode 25`) | Manual or low battery fallback | ❌ No — system is fully powered down |
+| Shut down | User action | ❌ No |
+
+Check your current mode:
+```bash
+pmset -g | grep hibernatemode
+```
+
+**Recommendation:** Keep the Mac plugged in overnight for the most reliable results. On AC power, macOS stays in standard or safe sleep and consistently honours `pmset` wake alarms. On battery, if charge drops low enough for macOS to fall into full hibernation, the alarm will not fire — this is a hardware constraint no software can work around.
+
+If the Mac was in full hibernation and the job was missed, launchd will still catch up and run it the next time the lid is opened.
 
 ## Technical Architecture
 
