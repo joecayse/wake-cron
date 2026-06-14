@@ -8,8 +8,8 @@
 set -euo pipefail
 
 LABEL_PREFIX="com.wake-cron"
-PLIST_DIR="$HOME/Library/LaunchAgents"
-JOBS_FILE="$HOME/.wake-cron-jobs"
+PLIST_DIR="${WAKE_CRON_PLIST_DIR:-$HOME/Library/LaunchAgents}"
+JOBS_FILE="${WAKE_CRON_JOBS_FILE:-$HOME/.wake-cron-jobs}"
 DEFAULT_TIMEOUT=300
 
 # Registry row format (pipe-delimited):
@@ -17,7 +17,7 @@ DEFAULT_TIMEOUT=300
 
 # ------------------------------------------------------------------------------
 # Issue #2: Comprehensive help documentation
-usage() {
+show_help() {
     cat <<'EOF'
 wake-cron — macOS hardware-wake + task scheduling
 
@@ -55,8 +55,10 @@ NOTES
   • pmset is always set to the earliest wake time across all active jobs.
   • macOS supports only one repeating pmset wake event system-wide.
 EOF
-    exit 0
 }
+
+# Print help and exit 1 (called on bad arguments)
+usage() { show_help; exit 1; }
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -281,7 +283,7 @@ cmd_modify() {
 # Route subcommands
 
 case "${1:-}" in
-    -help|--help) usage ;;
+    -help|--help) show_help; exit 0 ;;
     list) cmd_list ;;
     remove) [ -n "${2:-}" ] || usage; cmd_remove "$2" ;;
     modify) [ -n "${2:-}" ] && [ -n "${3:-}" ] || usage; cmd_modify "$2" "$3" ;;

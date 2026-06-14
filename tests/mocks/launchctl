@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Mock launchctl: log invocations, simulate load/unload/list behaviour.
+echo "launchctl $*" >> "${MOCK_LOG}/launchctl_calls"
+
+case "$1" in
+    load)
+        # Record loaded labels so 'list' can return a match
+        echo "$2" >> "${MOCK_LOG}/loaded_plists"
+        exit 0 ;;
+    unload)
+        # Remove from loaded set
+        [ -f "${MOCK_LOG}/loaded_plists" ] && \
+            grep -v "^$2$" "${MOCK_LOG}/loaded_plists" > "${MOCK_LOG}/loaded_plists.tmp" && \
+            mv "${MOCK_LOG}/loaded_plists.tmp" "${MOCK_LOG}/loaded_plists"
+        exit 0 ;;
+    list)
+        # Return fake launchd output if the label was previously loaded
+        label="${2:-}"
+        if [ -f "${MOCK_LOG}/loaded_plists" ] && grep -qF "$label" "${MOCK_LOG}/loaded_plists" 2>/dev/null; then
+            echo "{ \"Label\" = \"${label}\"; \"LastExitStatus\" = 0; };"
+            exit 0
+        fi
+        exit 1 ;;
+esac
+exit 0

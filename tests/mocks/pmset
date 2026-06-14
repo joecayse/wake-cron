@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Mock pmset: log every invocation and succeed silently.
+echo "pmset $*" >> "${MOCK_LOG}/pmset_calls"
+exit 0

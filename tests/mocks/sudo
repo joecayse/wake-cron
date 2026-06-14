@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Mock sudo: strip privilege escalation, run the command directly.
+# This lets mock pmset/launchctl be found via PATH.
+exec "$@"
