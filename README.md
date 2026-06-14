@@ -1,7 +1,29 @@
 # wake-cron: macOS Power Management and Task Scheduling Utility
 
-## Introduction
-`wake-cron` is a lightweight, command-line utility for macOS that ensures automated tasks run reliably despite sleep/wake cycles. It bridges hardware power management (`pmset`) and launchd task scheduling, guaranteeing execution as long as the Mac is not completely shut down or in deep hibernation.
+## Why wake-cron?
+
+**launchd can schedule tasks. `pmset` can wake a sleeping Mac. Neither talks to the other — wake-cron bridges that gap.**
+
+If your Mac is always on, you don't need this. Use launchd directly.
+
+But if your Mac sleeps, you have a problem: launchd's `StartCalendarInterval` only fires if the system is already awake. Schedule a job for 06:15 and let the Mac sleep at midnight — the job never runs. `pmset` can wake the hardware on a schedule, but it knows nothing about your tasks. You'd have to configure both manually, keep them in sync, and repeat that for every job.
+
+wake-cron does exactly that coordination in one command:
+
+```bash
+wake-cron 06:15 "/usr/bin/python3 /Users/joe/report.py"
+```
+
+It arms the hardware wake alarm 5 minutes early via `pmset`, deploys the job as a LaunchAgent, and keeps everything in sync — including when you have multiple jobs at different times.
+
+**Use wake-cron if:**
+- Your Mac sleeps overnight and you need tasks to run reliably in the morning
+- You want a one-liner instead of hand-writing plist XML and wiring up `pmset` separately
+- You need a job registry with `list`, `modify`, and `remove` without touching plist files
+
+**Use launchd directly if:**
+- Your Mac stays awake (server, always-on desktop)
+- You need advanced launchd features (file watchers, network conditions, dependencies)
 
 ## Why launchd Instead of cron
 
