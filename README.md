@@ -1,52 +1,93 @@
-# wake-cron: Schedules a cron job and ensures your Mac wakes up to run it
+# wake-cron: macOS Power Management and Task Scheduling Utility
 
 ## Introduction
-`wake-cron` is a lightweight, command-line utility designed specifically for macOS environments. It addresses the common friction point between hardware energy management and task automation. On macOS, the system power controller (pmset) and the cron daemon function as independent systems; `wake-cron` bridges this gap to ensure hardware availability before automated tasks execute.
+`wake-cron` is a lightweight, command-line utility for macOS that ensures automated tasks run reliably despite sleep/wake cycles. It bridges hardware power management (`pmset`) and launchd task scheduling, guaranteeing execution as long as the Mac is not completely shut down or in deep hibernation.
+
+## Why launchd Instead of cron
+
+The original version used `cron`, which **silently drops jobs scheduled while the system is asleep**. `wake-cron` uses macOS-native **launchd LaunchAgents** with `StartCalendarInterval`. launchd fires any missed calendar jobs immediately upon the next system wake.
+
+| Behavior | cron | launchd |
+| :--- | :--- | :--- |
+| Fires while system is awake | ✅ | ✅ |
+| Fires missed job after wake from sleep | ❌ | ✅ |
+| Full PATH / user environment | ❌ | ✅ (login shell) |
+| Timeout guardrail for hung scripts | ❌ | ✅ |
+| Multiple independent job schedules | ✅ | ✅ |
 
 ## Technical Architecture
 
-The utility operates by synchronizing two distinct system-level processes:
-
 ### 1. Hardware Wake Synchronization
-The tool calculates a 5-minute pre-execution buffer. It interfaces with the System Management Controller (SMC) via pmset to schedule a hardware wake event. This ensures:
-- The system exits sleep/hibernation mode.
-- Wireless/network interfaces initialize and re-establish connectivity.
-- Background system services are active before the primary task execution.
+`wake-cron` calculates a 5-minute pre-execution buffer and uses `pmset repeat wake` to arm a daily hardware wake event. When multiple jobs are scheduled, it always uses the **earliest** wake time across all jobs — avoiding the single-schedule limitation of `pmset repeat`.
 
-### 2. Task Injection Logic
-`wake-cron` automates crontab management, providing a cleaner alternative to manual configuration. It handles:
-- Path Validation: Ensures executables are reachable.
-- Entry Sanitization: Prevents duplicate entries in the local crontab.
-- Atomic Scheduling: Aligns the hardware alarm and the cron job precisely.
+### 2. LaunchAgent Injection
+Each job is deployed as a `~/Library/LaunchAgents/com.wake-cron.<JOB_ID>.plist` file and loaded immediately via `launchctl`. Jobs run in a login shell (`/bin/bash -l`) so tools installed via Homebrew, rbenv, nvm, etc. are on PATH.
 
-## Deployment and Configuration
+### 3. Timeout Guardrail
+Every job is wrapped with `/usr/bin/timeout` (default: 300 seconds). If a script hangs due to a dropped network connection or unresponsive API, the process is force-killed after the timeout window, preventing indefinite machine wake and resource drain. Configurable per job via `--timeout`.
 
-### Installation
-Deploy the utility using the provided shell script:
+### 4. Job State Registry
+A lightweight registry at `~/.wake-cron-jobs` tracks all scheduled jobs. This enables `list`, `modify`, and `remove` operations by JOB_ID, and ensures `pmset` is always synchronized to the earliest required wake time.
+
+## Installation
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/joecayse/wake-cron/main/install.sh | bash
+```
 
-### Syntax
-wake-cron [HH:MM] "[executable_command]"
+## Syntax
 
-Operational Example:
-wake-cron 06:15 "/usr/bin/python3 /Users/joecayse/example.py
+```
+wake-cron [HH:MM] "[command]" [--timeout SECS]   Schedule (or update) a daily job
+wake-cron list                                    List all active jobs
+wake-cron modify <JOB_ID> [HH:MM]                Update an existing job's time
+wake-cron remove <JOB_ID>                         Remove a job and clean up pmset
+wake-cron -help | --help                          Show help and exit
+```
 
-## System Requirements, Limitations, & Security
-Due to macOS security sandboxing, the cron engine requires explicit Full Disk Access.
+### Flags
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--timeout SECS` | `300` | Max runtime before the job process is force-killed |
+
+### Examples
+
+```bash
+# Schedule a Python script at 06:15 daily
+wake-cron 06:15 "/usr/bin/python3 /Users/joe/report.py"
+
+# Schedule with a custom 2-minute timeout
+wake-cron 06:15 "/usr/bin/python3 /Users/joe/report.py" --timeout 120
+
+# List all scheduled jobs (shows JOB_ID, time remaining, status)
+wake-cron list
+
+# Update an existing job's execution time
+wake-cron modify a1b2c3d4 07:00
+
+# Remove a job — cleans registry and syncs pmset
+wake-cron remove a1b2c3d4
+```
+
+### Execution Logs
+
+Each job writes stdout and stderr to:
+- `/tmp/wake-cron-<JOB_ID>.log`
+- `/tmp/wake-cron-<JOB_ID>.err`
+
+## System Requirements & Security
+
+Due to macOS security sandboxing, launchd requires **Full Disk Access** to run tasks that touch protected directories.
 
 | Step | Action |
 | :--- | :--- |
-| 1 | Navigate to System Settings > Privacy & Security > Full Disk Access. |
-| 2 | Select the + button. |
-| 3 | Use Cmd + Shift + G to navigate to /usr/sbin/cron. |
-| 4 | Ensure the service toggle is switched to ON. |
+| 1 | Navigate to **System Settings > Privacy & Security > Full Disk Access** |
+| 2 | Click **+** |
+| 3 | Press **Cmd + Shift + G** and navigate to `/bin/bash` |
+| 4 | Ensure the toggle is **ON** |
 
-
-**AC Power Dependency:** For reliable execution, wake-cron requires the system to be connected to AC power. macOS energy-management policies significantly throttle or suppress hardware wake events when operating on battery.
-
-**Hardware Assertions:** macOS may prevent wake events based on thermal conditions or active assertions. Users can check for blocking states using pmset -g assertions.
-
-**Future Roadmap:** Future versions may transition to launchd to provide more robust task scheduling and better integration with native macOS power management.
+> **Note:** `pmset repeat` only supports one repeating power-on event system-wide. `wake-cron` manages this automatically by always setting `pmset` to the earliest scheduled wake time across all jobs.
 
 ## Summary
-`wake-cron` simplifies the automation lifecycle for macOS users requiring deterministic execution of background tasks. By coupling hardware wake events with standard cron scheduling, it minimizes execution failure due to power-state transitions. This utility is maintained under the MIT License and is designed for modular expansion to include advanced CLI flags in future releases.
+`wake-cron` provides deterministic daily task execution for macOS by coupling hardware wake events (`pmset`) with launchd LaunchAgents. Jobs missed during sleep are caught up immediately on wake. Hung scripts are automatically killed by a configurable timeout guardrail. The utility is maintained under the MIT License.

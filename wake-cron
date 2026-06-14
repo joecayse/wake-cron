@@ -1,80 +1,353 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# wake-cron: Unified hardware wake and crontab synchronization for macOS
+# wake-cron: Unified hardware wake and task scheduling for macOS
+# Uses launchd LaunchAgents instead of cron for reliable post-sleep execution.
+# launchd fires missed StartCalendarInterval jobs on wake; cron does not.
 # ==============================================================================
 
-set -e
+set -euo pipefail
 
-# Print usage instructions
+LABEL_PREFIX="com.wake-cron"
+PLIST_DIR="$HOME/Library/LaunchAgents"
+JOBS_FILE="$HOME/.wake-cron-jobs"
+DEFAULT_TIMEOUT=300
+
+# Registry row format (pipe-delimited):
+# HASH|WAKE_H|WAKE_M|EXEC_H|EXEC_M|TIMEOUT|CMD
+
+# ------------------------------------------------------------------------------
+# Issue #2: Comprehensive help documentation
 usage() {
-    echo "Usage: wake-cron [HH:MM] \"[cron_command]\""
-    echo "Example: wake-cron 06:15 \"/usr/bin/python3 /path/to/script.py\""
-    exit 1
+    cat <<'EOF'
+wake-cron — macOS hardware-wake + task scheduling
+
+COMMANDS
+  wake-cron [HH:MM] "[command]" [--timeout SECS]
+      Schedule (or update) a daily job. Wakes hardware 5 minutes early.
+      Default timeout: 300s.
+
+  wake-cron list
+      Show all active jobs: ID, exec time, time remaining, status, command.
+
+  wake-cron modify <JOB_ID> [HH:MM]
+      Update the execution time of an existing job without restarting it.
+
+  wake-cron remove <JOB_ID>
+      Gracefully unload the job, clean the registry, and sync pmset.
+
+  wake-cron -help | --help
+      Show this help text and exit 0.
+
+FLAGS
+  --timeout SECS   Max runtime before the job is force-killed (default: 300).
+                   Prevents hung scripts from keeping the machine awake.
+
+EXAMPLES
+  wake-cron 06:15 "/usr/bin/python3 /Users/joe/report.py"
+  wake-cron 06:15 "/usr/bin/python3 /Users/joe/report.py" --timeout 120
+  wake-cron list
+  wake-cron modify a1b2c3d4 07:00
+  wake-cron remove a1b2c3d4
+
+NOTES
+  • Jobs run in a login shell (/bin/bash -l) for full PATH (Homebrew, rbenv, nvm …).
+  • Logs: /tmp/wake-cron-<JOB_ID>.log  /tmp/wake-cron-<JOB_ID>.err
+  • pmset is always set to the earliest wake time across all active jobs.
+  • macOS supports only one repeating pmset wake event system-wide.
+EOF
+    exit 0
 }
 
-# Ensure correct number of arguments passed
-if [ "$#" -ne 2 ]; then
-    usage
-fi
+# ------------------------------------------------------------------------------
+# Helpers
 
-TARGET_TIME=$1
-CRON_CMD=$2
+cmd_hash() {
+    echo "$1" | md5 -q | head -c 8
+}
 
-# Validate time format (HH:MM, 24-hour clock)
+# Seconds until the next daily occurrence of EXEC_H:EXEC_M
+time_remaining_secs() {
+    local h=$((10#$1)) m=$((10#$2))
+    local now_secs target_secs diff
+    now_secs=$(( $(date +%H) * 3600 + $(date +%M) * 60 + $(date +%S) ))
+    target_secs=$(( h * 3600 + m * 60 ))
+    diff=$(( target_secs - now_secs ))
+    [ "$diff" -le 0 ] && diff=$(( diff + 86400 ))
+    echo "$diff"
+}
+
+format_remaining() {
+    local secs=$1
+    printf "%dh %02dm" $(( secs / 3600 )) $(( (secs % 3600) / 60 ))
+}
+
+# Issue #4: STATUS — check whether launchd has the agent loaded and running
+job_status() {
+    local label="$1"
+    local info
+    info=$(launchctl list "$label" 2>/dev/null) || { echo "unloaded"; return; }
+    # If a PID key is present and non-zero, the job is actively executing
+    local pid
+    pid=$(echo "$info" | awk -F'[ =;]+' '/"PID"/{print $3}' | tr -d '"' || true)
+    if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+        echo "running"
+    else
+        echo "pending"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Recompute and arm pmset to the earliest wake time across all jobs.
+# Issue #5: verify no rogue wake timers remain when last job is removed.
+sync_pmset() {
+    if [ ! -f "$JOBS_FILE" ] || [ ! -s "$JOBS_FILE" ]; then
+        echo "[*] No jobs remaining — cancelling hardware wake schedule."
+        sudo pmset repeat cancel 2>/dev/null || true
+        return
+    fi
+
+    local earliest_total=99999 earliest_hour=0 earliest_min=0
+    while IFS='|' read -r _hash wake_h wake_m _exec_h _exec_m _timeout _cmd; do
+        local total=$(( wake_h * 60 + wake_m ))
+        if [ "$total" -lt "$earliest_total" ]; then
+            earliest_total=$total
+            earliest_hour=$wake_h
+            earliest_min=$wake_m
+        fi
+    done < "$JOBS_FILE"
+
+    local wake_str
+    wake_str=$(printf "%02d:%02d:00" "$earliest_hour" "$earliest_min")
+    echo "[*] Arming hardware wake at $wake_str (covers all scheduled jobs)..."
+    sudo pmset repeat wake MTWRFSU "$wake_str"
+}
+
+# Write (or overwrite) a LaunchAgent plist and load it.
+write_plist() {
+    local hash="$1" exec_h="$2" exec_m="$3" timeout="$4" cmd="$5"
+    local label="${LABEL_PREFIX}.${hash}"
+    local plist_path="${PLIST_DIR}/${label}.plist"
+
+    if [ -f "$plist_path" ]; then
+        launchctl unload "$plist_path" 2>/dev/null || true
+    fi
+
+    mkdir -p "$PLIST_DIR"
+
+    # Issue #1: wrap command with /usr/bin/timeout so hung scripts are killed
+    # after TIMEOUT seconds, preventing indefinite machine wake and resource drain.
+    cat > "$plist_path" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-l</string>
+        <string>-c</string>
+        <string>/usr/bin/timeout ${timeout} /bin/bash -l -c ${cmd}</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>${exec_h}</integer>
+        <key>Minute</key>
+        <integer>${exec_m}</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/wake-cron-${hash}.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/wake-cron-${hash}.err</string>
+</dict>
+</plist>
+PLIST
+
+    launchctl load "$plist_path"
+}
+
+# ------------------------------------------------------------------------------
+# Issue #4: list subcommand — structured table with JOB_ID, time remaining, status
+cmd_list() {
+    if [ ! -f "$JOBS_FILE" ] || [ ! -s "$JOBS_FILE" ]; then
+        echo "No wake-cron jobs scheduled."
+        exit 0
+    fi
+    printf "%-10s  %-10s  %-12s  %-10s  %-8s  %s\n" \
+        "JOB_ID" "EXEC TIME" "REMAINING" "STATUS" "TIMEOUT" "COMMAND"
+    printf "%-10s  %-10s  %-12s  %-10s  %-8s  %s\n" \
+        "------" "---------" "---------" "------" "-------" "-------"
+    while IFS='|' read -r hash wake_h wake_m exec_h exec_m timeout cmd; do
+        local label="${LABEL_PREFIX}.${hash}"
+        local status remaining
+        status=$(job_status "$label")
+        remaining=$(format_remaining "$(time_remaining_secs "$exec_h" "$exec_m")")
+        printf "%-10s  %-10s  %-12s  %-10s  %-8s  %s\n" \
+            "$hash" \
+            "$(printf "%02d:%02d" "$exec_h" "$exec_m")" \
+            "$remaining" \
+            "$status" \
+            "${timeout}s" \
+            "$cmd"
+    done < "$JOBS_FILE"
+    exit 0
+}
+
+# ------------------------------------------------------------------------------
+# Issue #5: remove subcommand — graceful cleanup: unload agent, wipe registry,
+# sync pmset so no rogue wake timers remain
+cmd_remove() {
+    local hash="$1"
+    local label="${LABEL_PREFIX}.${hash}"
+    local plist_path="${PLIST_DIR}/${label}.plist"
+
+    if [ ! -f "$plist_path" ]; then
+        echo "[X] No job found with JOB_ID '$hash'. Use 'wake-cron list' to see active jobs."
+        exit 1
+    fi
+
+    echo "[*] Stopping job $hash..."
+    launchctl unload "$plist_path" 2>/dev/null || true
+    rm -f "$plist_path"
+
+    touch "$JOBS_FILE"
+    grep -v "^${hash}|" "$JOBS_FILE" > "${JOBS_FILE}.tmp" 2>/dev/null || true
+    mv "${JOBS_FILE}.tmp" "$JOBS_FILE"
+
+    echo "[*] Registry entry removed for $hash."
+    echo "[!] Escalating privileges to update macOS power management schedule..."
+    sync_pmset
+
+    # Verify: confirm plist and launchd entry are gone
+    if launchctl list "$label" &>/dev/null; then
+        echo "[!] Warning: launchd entry for $label still present — may need manual removal."
+    else
+        echo "[*] Verified: no active launchd entry for $hash."
+    fi
+
+    echo "[SUCCESS] Job $hash fully terminated and registry cleaned."
+    exit 0
+}
+
+# ------------------------------------------------------------------------------
+# Issue #3: modify subcommand — update execution time of an existing job
+# without losing the command payload or timeout configuration
+cmd_modify() {
+    local hash="$1" new_time="$2"
+
+    if [[ ! $new_time =~ ^([0-1][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+        echo "[X] Invalid time format. Use HH:MM (24-hour, e.g., 07:30)."
+        exit 1
+    fi
+
+    if [ ! -f "$JOBS_FILE" ] || ! grep -q "^${hash}|" "$JOBS_FILE"; then
+        echo "[X] No job found with JOB_ID '$hash'. Use 'wake-cron list' to see active jobs."
+        exit 1
+    fi
+
+    local rec
+    rec=$(grep "^${hash}|" "$JOBS_FILE")
+    local old_timeout old_cmd
+    old_timeout=$(echo "$rec" | cut -d'|' -f6)
+    old_cmd=$(echo "$rec" | cut -d'|' -f7)
+
+    local new_exec_h=$((10#$(echo "$new_time" | cut -d: -f1)))
+    local new_exec_m=$((10#$(echo "$new_time" | cut -d: -f2)))
+
+    local new_wake_m=$(( new_exec_m - 5 ))
+    local new_wake_h=$new_exec_h
+    if [ "$new_wake_m" -lt 0 ]; then
+        new_wake_m=$(( new_wake_m + 60 ))
+        new_wake_h=$(( new_wake_h - 1 ))
+        [ "$new_wake_h" -lt 0 ] && new_wake_h=23
+    fi
+
+    write_plist "$hash" "$new_exec_h" "$new_exec_m" "$old_timeout" "$old_cmd"
+    echo "[*] LaunchAgent updated: job $hash → $(printf "%02d:%02d" "$new_exec_h" "$new_exec_m")"
+
+    grep -v "^${hash}|" "$JOBS_FILE" > "${JOBS_FILE}.tmp" 2>/dev/null || true
+    echo "${hash}|${new_wake_h}|${new_wake_m}|${new_exec_h}|${new_exec_m}|${old_timeout}|${old_cmd}" >> "${JOBS_FILE}.tmp"
+    mv "${JOBS_FILE}.tmp" "$JOBS_FILE"
+
+    echo "[!] Escalating privileges to update macOS power management schedule..."
+    sync_pmset
+    echo "[SUCCESS] Job $hash rescheduled to $(printf "%02d:%02d" "$new_exec_h" "$new_exec_m")."
+    exit 0
+}
+
+# ------------------------------------------------------------------------------
+# Route subcommands
+
+case "${1:-}" in
+    -help|--help) usage ;;
+    list) cmd_list ;;
+    remove) [ -n "${2:-}" ] || usage; cmd_remove "$2" ;;
+    modify) [ -n "${2:-}" ] && [ -n "${3:-}" ] || usage; cmd_modify "$2" "$3" ;;
+esac
+
+# ------------------------------------------------------------------------------
+# Schedule (default path)
+
+if [ "$#" -lt 2 ]; then usage; fi
+
+TARGET_TIME="$1"
+CRON_CMD="$2"
+JOB_TIMEOUT=$DEFAULT_TIMEOUT
+
+shift 2
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --timeout)
+            if [ -z "${2:-}" ] || ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                echo "[X] --timeout requires a positive integer (seconds)."
+                exit 1
+            fi
+            JOB_TIMEOUT="$2"; shift 2 ;;
+        *) echo "[X] Unknown flag: $1"; usage ;;
+    esac
+done
+
 if [[ ! $TARGET_TIME =~ ^([0-1][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
-    echo "[X] Error: Invalid time format. Please use HH:MM (24-hour format, e.g., 06:15)."
+    echo "[X] Invalid time format. Use HH:MM in 24-hour format (e.g., 06:15)."
     exit 1
 fi
 
-# Extract components
-TARGET_HOUR=$(echo "$TARGET_TIME" | cut -d: -f1)
-TARGET_MIN=$(echo "$TARGET_TIME" | cut -d: -f2)
+TARGET_HOUR=$((10#$(echo "$TARGET_TIME" | cut -d: -f1)))
+TARGET_MIN=$((10#$(echo "$TARGET_TIME" | cut -d: -f2)))
 
-# Convert strings to base-10 integers to protect against octal interpretation issues
-TARGET_HOUR=$((10#$TARGET_HOUR))
-TARGET_MIN=$((10#$TARGET_MIN))
-
-# Calculate hardware wake time (Target time minus a 5-minute buffer)
+WAKE_MIN=$(( TARGET_MIN - 5 ))
 WAKE_HOUR=$TARGET_HOUR
-WAKE_MIN=$((TARGET_MIN - 5))
-
-# Handle time underflow arithmetic safely
-if [ $WAKE_MIN -lt 0 ]; then
-    WAKE_MIN=$((WAKE_MIN + 60))
-    WAKE_HOUR=$((WAKE_HOUR - 1))
-    if [ $WAKE_HOUR -lt 0 ]; then
-        WAKE_HOUR=23
-    fi
+if [ "$WAKE_MIN" -lt 0 ]; then
+    WAKE_MIN=$(( WAKE_MIN + 60 ))
+    WAKE_HOUR=$(( WAKE_HOUR - 1 ))
+    [ "$WAKE_HOUR" -lt 0 ] && WAKE_HOUR=23
 fi
 
-# Format wake string to preserve leading zeros for pmset (HH:MM:SS)
-WAKE_TIME_STR=$(printf "%02d:%02d:00" $WAKE_HOUR $WAKE_MIN)
+HASH=$(cmd_hash "$CRON_CMD")
 
-echo "[*] Target execution synchronized at: $(printf "%02d:%02d" $TARGET_HOUR $TARGET_MIN)"
-echo "[*] Configuring hardware-level alarm wake at: $WAKE_TIME_STR"
+echo "[*] Scheduling job $HASH"
+echo "[*] Execution target:  $(printf "%02d:%02d" "$TARGET_HOUR" "$TARGET_MIN")"
+echo "[*] Hardware wake:     $(printf "%02d:%02d" "$WAKE_HOUR" "$WAKE_MIN")  (5-min buffer)"
+echo "[*] Timeout guardrail: ${JOB_TIMEOUT}s"
 
-# 1. Update Hardware Power Schedule (Requires root escalation)
+write_plist "$HASH" "$TARGET_HOUR" "$TARGET_MIN" "$JOB_TIMEOUT" "$CRON_CMD"
+echo "[*] LaunchAgent loaded: ${LABEL_PREFIX}.${HASH}"
+
+touch "$JOBS_FILE"
+grep -v "^${HASH}|" "$JOBS_FILE" > "${JOBS_FILE}.tmp" 2>/dev/null || true
+echo "${HASH}|${WAKE_HOUR}|${WAKE_MIN}|${TARGET_HOUR}|${TARGET_MIN}|${JOB_TIMEOUT}|${CRON_CMD}" >> "${JOBS_FILE}.tmp"
+mv "${JOBS_FILE}.tmp" "$JOBS_FILE"
+
 echo "[!] Escalating privileges to update macOS power management schedule..."
-echo "[!] Note: macOS only supports one repeating hardware schedule. Previous schedules will be overwritten."
-sudo pmset repeat wake MTWRFSU "$WAKE_TIME_STR"
+sync_pmset
 
-# 2. Update User-Level Crontab (Kept entirely within user-space context)
-echo "[*] Injecting target task into user crontab..."
-
-# Format the cron schedule string
-CRON_ENTRY="$TARGET_MIN $TARGET_HOUR * * * $CRON_CMD"
-
-# Safely read existing crontab (ignoring 'no crontab' errors) and filter out fixed strings
-OLD_CRONTAB=$(crontab -l 2>/dev/null | grep -F -v "$CRON_CMD" || true)
-
-# Atomically deploy the newly combined crontab layout
-(
-    if [ -n "$OLD_CRONTAB" ]; then
-        echo "$OLD_CRONTAB"
-    fi
-    echo "$CRON_ENTRY"
-) | crontab -
-
-echo "[SUCCESS] wake-cron synchronization finalized."
-echo "          -> Hardware wakeup armed for $WAKE_TIME_STR every day."
-echo "          -> Cron engine scheduled task execution for $TARGET_TIME every day."
+echo ""
+echo "[SUCCESS] wake-cron synchronization complete."
+echo "          -> JOB_ID:         $HASH"
+echo "          -> Hardware wake:  $(printf "%02d:%02d" "$WAKE_HOUR" "$WAKE_MIN") daily (all days)"
+echo "          -> Execution:      $(printf "%02d:%02d" "$TARGET_HOUR" "$TARGET_MIN") daily"
+echo "          -> Timeout:        ${JOB_TIMEOUT}s"
+echo "          -> Stdout log:     /tmp/wake-cron-${HASH}.log"
+echo "          -> Stderr log:     /tmp/wake-cron-${HASH}.err"
